@@ -1,0 +1,12 @@
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+
+COPY ["src/EmailService/", "EmailService/"]
+COPY ["src/Domain/", "Domain/"]
+COPY ["src/Infrastructure/", "Infrastructure/"]
+
+RUN dotnet restore EmailService/EmailService.csproj
+
+WORKDIR /src/EmailService
+
+ENTRYPOINT ["dotnet", "run"]
