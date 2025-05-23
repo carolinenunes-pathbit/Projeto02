@@ -72,7 +72,7 @@ Após iniciar a aplicação, acesse `http://localhost:9090` em seu navegador.
    - Senha
    - Confirmação de Senha
 
-## ✉️ Notificações por E-mail
+## Notificações por E-mail
 
 Após o cadastro, o cliente receberá um e-mail com a seguinte mensagem:
 
