@@ -9,7 +9,7 @@ namespace Domain.Contracts.Infrastructure
     public interface ICustomerRepository
     {
         Task<Customer> GetCustomerIdAsync(string id);
-        ValueTask<string> GetCustomerIdByEmailAsync(string email);
+        ValueTask<string?> GetCustomerIdByEmailAsync(string email);
         Task SaveCustomerAsync(Customer customer);
         Task UpdateCustomerAsync(Customer customer);
         ValueTask<bool> ExistingEmailAsync(string email);

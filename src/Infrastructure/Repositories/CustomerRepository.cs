@@ -23,7 +23,7 @@ namespace Infrastructure.Repositories
             return await _collection.Find(filter).FirstOrDefaultAsync();
         }
 
-        public async ValueTask<string> GetCustomerIdByEmailAsync(string email)
+        public async ValueTask<string?> GetCustomerIdByEmailAsync(string email)
         {
             var filter = Builders<Customer>.Filter.Eq(c => c.Email, email);
             var customer = await _collection.Find(filter).FirstOrDefaultAsync();

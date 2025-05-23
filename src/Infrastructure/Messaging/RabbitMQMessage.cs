@@ -1,133 +1,255 @@
+using System;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using Domain.Contracts.Infrastructure;
-using System.Text;
+
+// Explicitly reference the RabbitMQ.Client assembly to ensure IModel is found
+[assembly: System.Runtime.CompilerServices.TypeForwardedTo(typeof(RabbitMQ.Client.IModel))]
 
 namespace Infrastructure.Messaging;
 
-public class RabbitMqMessage : IMessageService, IDisposable
+public class RabbitMQMessage : IMessageService, IDisposable
 {
-    private IConnection _connection;
-    private IChannel _channel;
+    private IConnection? _connection;
+    private IModel? _channel;
     private readonly ConnectionFactory _factory;
     private const string ROUTING_KEY = "cadastro.em.analise.email";
+    private readonly object _lock = new();
+    private bool _disposed;
+    private const int MAX_RETRY_ATTEMPTS = 5;
+    private const int RETRY_DELAY_MS = 5000;
 
-    public RabbitMqMessage()
+    public RabbitMQMessage()
     {
-        _factory = new ConnectionFactory { HostName = "rabbitmq" };
-        Console.WriteLine($"[LOG] {DateTime.Now}: ConnectionFactory criada com HostName: {_factory.HostName}");
+        _factory = new ConnectionFactory
+        {
+            HostName = "rabbitmq",
+            Port = 5672,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            AutomaticRecoveryEnabled = true,
+            NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
+        };
     }
 
-    private async ValueTask ConnectAsync()
+    private async Task EnsureConnected()
     {
-        Console.WriteLine($"[LOG] {DateTime.Now}: Tentando conectar ao RabbitMQ...");
-        if (_connection is null || !_connection.IsOpen)
+        if (_connection?.IsOpen == true && _channel?.IsOpen == true)
+        {
+            return;
+        }
+
+        int retryCount = 0;
+        Exception? lastError = null;
+
+        while (retryCount < MAX_RETRY_ATTEMPTS)
         {
             try
             {
-                _connection = await _factory.CreateConnectionAsync();
-                Console.WriteLine($"[LOG] {DateTime.Now}: Conexão estabelecida com sucesso.");
+                // Fecha conexões existentes de forma assíncrona
+                if (_channel != null)
+                {
+                    if (_channel.IsOpen) await Task.Run(() => _channel.Close());
+                    _channel.Dispose();
+                    _channel = null;
+                }
+
+                if (_connection != null)
+                {
+                    if (_connection.IsOpen) await Task.Run(() => _connection.Close());
+                    _connection.Dispose();
+                    _connection = null;
+                }
+
+
+                // Cria nova conexão de forma assíncrona
+                _connection = await Task.Run(() => _factory.CreateConnection());
+                _connection.ConnectionShutdown += OnConnectionShutdown;
+                _connection.CallbackException += OnCallbackException;
+                _connection.ConnectionBlocked += OnConnectionBlocked;
+                
+                _channel = await Task.Run(() => _connection.CreateModel());
+                return;
+            }
+            catch (Exception ex) when (retryCount < MAX_RETRY_ATTEMPTS - 1)
+            {
+                lastError = ex;
+                retryCount++;
+                await Task.Delay(RETRY_DELAY_MS);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ERRO] {DateTime.Now}: Erro ao conectar: {ex.Message}");
-                throw; // Re-lança a exceção para ser tratada no SendMessageAsync
+                lastError = ex;
+                break;
             }
         }
 
-        if (_channel is null || !_channel.IsOpen)
-        {
-            try
-            {
-                _channel = await _connection.CreateChannelAsync();
-                Console.WriteLine($"[LOG] {DateTime.Now}: Canal criado com sucesso.");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERRO] {DateTime.Now}: Erro ao criar canal: {ex.Message}");
-                throw;
-            }
-        }
+        throw new InvalidOperationException($"Não foi possível conectar ao RabbitMQ após {MAX_RETRY_ATTEMPTS} tentativas", lastError);
+    }
+
+    private void OnConnectionShutdown(object? sender, ShutdownEventArgs e)
+    {
+        Console.WriteLine($"Conexão com RabbitMQ encerrada. Motivo: {e.ReplyText}");
+    }
+
+    private void OnCallbackException(object? sender, CallbackExceptionEventArgs e)
+    {
+        Console.WriteLine($"Erro no callback do RabbitMQ: {e.Exception}");
+    }
+
+    private void OnConnectionBlocked(object? sender, ConnectionBlockedEventArgs e)
+    {
+        Console.WriteLine($"Conexão com RabbitMQ bloqueada. Motivo: {e.Reason}");
     }
 
     public async ValueTask SendMessageAsync(string queue, string message)
     {
-        Console.WriteLine($"[LOG] {DateTime.Now}: Tentando enviar mensagem: '{message}' para a fila: '{queue}'");
+        if (string.IsNullOrWhiteSpace(queue))
+            throw new ArgumentException("O nome da fila não pode ser vazio", nameof(queue));
+            
+        if (string.IsNullOrWhiteSpace(message))
+            throw new ArgumentException("A mensagem não pode ser vazia", nameof(message));
+
         try
         {
-            await ConnectAsync();
-            Console.WriteLine($"[LOG] {DateTime.Now}: Conexão e canal verificados/criados.");
-
-            Console.WriteLine($"[LOG] {DateTime.Now}: Declarando fila: '{queue}'...");
-            await _channel.QueueDeclareAsync(queue: queue,
-                durable: false,
-                exclusive: false,
-                autoDelete: false,
-                arguments: null);
-            Console.WriteLine($"[LOG] {DateTime.Now}: Fila '{queue}' declarada com sucesso.");
+            await EnsureConnected();
+            if (_channel == null)
+                throw new InvalidOperationException("Canal não inicializado");
 
             var body = Encoding.UTF8.GetBytes(message);
-            Console.WriteLine($"[LOG] {DateTime.Now}: Mensagem convertida para bytes.");
-
-            Console.WriteLine($"[LOG] {DateTime.Now}: Publicando mensagem para a fila: '{queue}' com Routing Key: '{ROUTING_KEY}'...");
-            await IChannelExtensions.BasicPublishAsync(channel: _channel,
+            
+            _channel.BasicPublish(
                 exchange: string.Empty,
-                routingKey: ROUTING_KEY,
+                routingKey: queue,
+                mandatory: true,
+                basicProperties: null,
                 body: body);
-            Console.WriteLine($"[LOG] {DateTime.Now}: Mensagem publicada com sucesso para a fila: '{queue}'.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ERRO] {DateTime.Now}: Erro ao enviar mensagem para a fila '{queue}': {ex.Message}");
+            Console.WriteLine($"Falha ao enviar mensagem para a fila '{queue}': {ex}");
+            throw;
         }
     }
 
     public async Task GetMessageAsync(string queue, Action<string> callbackMethod)
     {
-        Console.WriteLine($"[LOG] {DateTime.Now}: Tentando receber mensagens da fila: '{queue}'...");
+        if (string.IsNullOrWhiteSpace(queue))
+            throw new ArgumentException("O nome da fila não pode ser vazio", nameof(queue));
+            
+        if (callbackMethod == null)
+            throw new ArgumentNullException(nameof(callbackMethod));
+
+        await EnsureConnected();
+        if (_channel == null)
+            throw new InvalidOperationException("Canal não inicializado");
+
         try
         {
-            await ConnectAsync();
-            Console.WriteLine($"[LOG] {DateTime.Now}: Conexão e canal verificados/criados para receber.");
-
-            Console.WriteLine($"[LOG] {DateTime.Now}: Declarando fila: '{queue}' para consumo...");
-            await _channel.QueueDeclareAsync(queue: queue,
-                durable: false,
+            // Declara a fila se não existir
+            _channel.QueueDeclare(
+                queue: queue,
+                durable: true,
                 exclusive: false,
                 autoDelete: false,
                 arguments: null);
-            Console.WriteLine($"[LOG] {DateTime.Now}: Fila '{queue}' declarada com sucesso para consumo.");
+            
+            // Configura o QoS para processar uma mensagem por vez
+            _channel.BasicQos(0, 1, false);
 
-            Console.WriteLine($"[LOG] {DateTime.Now}: Criando consumidor para a fila: '{queue}'...");
-            var consumer = new AsyncEventingBasicConsumer(_channel);
-            consumer.ReceivedAsync += async (model, ea) =>
+            var consumer = new EventingBasicConsumer(_channel);
+            
+            consumer.Received += (model, ea) =>
             {
-                Console.WriteLine($"[LOG] {DateTime.Now}: Mensagem recebida.");
-                var body = ea.Body.ToArray();
-                var message = Encoding.UTF8.GetString(body);
-                callbackMethod(message);
-                await Task.Yield(); // Para evitar warnings de método async sem await no caminho principal
+                try
+                {
+                    var body = ea.Body.ToArray();
+                    var message = Encoding.UTF8.GetString(body);
+                    
+                    // Processa a mensagem
+                    callbackMethod(message);
+                    
+                    // Confirma o processamento
+                    _channel?.BasicAck(ea.DeliveryTag, multiple: false);
+                }
+                catch (Exception ex)
+                {
+                    // Nega o reconhecimento da mensagem para que ela seja reprocessada
+                    try
+                    {
+                        _channel?.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
+                    }
+                    catch (Exception nackEx)
+                    {
+                        Console.WriteLine($"Falha ao negar reconhecimento da mensagem: {nackEx}");
+                    }
+                }
             };
-            Console.WriteLine($"[LOG] {DateTime.Now}: Consumidor criado.");
 
-            Console.WriteLine($"[LOG] {DateTime.Now}: Iniciando consumo da fila: '{queue}'...");
-            await _channel.BasicConsumeAsync(queue: queue, // Usando o nome da fila
-                                               autoAck: true,
-                                               consumer: consumer);
-            Console.WriteLine($"[LOG] {DateTime.Now}: Consumo iniciado na fila: '{queue}'.");
+            // Inicia o consumo de mensagens
+            var consumerTag = _channel.BasicConsume(
+                queue: queue,
+                autoAck: false,
+                consumer: consumer);
+                
+            // Retorna uma tarefa que nunca completa, mantendo o consumidor ativo
+            await Task.Delay(Timeout.Infinite);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ERRO] {DateTime.Now}: Erro ao configurar o consumo da fila '{queue}': {ex.Message}");
+            Console.WriteLine($"Falha ao configurar o consumo da fila '{queue}': {ex}");
+            throw;
         }
     }
 
     public void Dispose()
     {
-        if (_channel != null && _channel.IsOpen)
-            _channel.Dispose();
-        if (_connection != null && _connection.IsOpen)
-            _connection.Dispose();
-        Console.WriteLine($"[LOG] {DateTime.Now}: Conexão e canal Disposed.");
-	}
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    ~RabbitMQMessage()
+    {
+        Dispose(false);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+        
+        if (disposing)
+        {
+            try
+            {
+                // Libera os recursos gerenciados
+                if (_channel != null)
+                {
+                    if (_channel.IsOpen)
+                        _channel.Close();
+                    _channel.Dispose();
+                }
+                
+                if (_connection != null)
+                {
+                    if (_connection.IsOpen)
+                        _connection.Close();
+                    _connection.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro ao liberar recursos: {ex.Message}");
+            }
+            finally
+            {
+                _channel = null;
+                _connection = null;
+                _disposed = true;
+            }
+        }
+    }
 }

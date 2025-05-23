@@ -1,2 +1,2 @@
-export const URL = "http://localhost:5000/customer";
+export const URL = "http://localhost:8080/customer";
 export var ID = '';

@@ -23,10 +23,12 @@ services:
       context: .
       dockerfile: Dockerfile.emailservice
     container_name: emailservice
-    depends_on:
-      - rabbitmq
+    env_file:
+      - .env
     ports:
       - "3030:3030"
+    depends_on:
+      - rabbitmq
     networks:
       - app-network
 
@@ -38,7 +40,7 @@ services:
     environment:
       - ConnectionStrings__MongoDb=mongodb://mongodb:27017/cadastro
     ports:
-      - "5000:5000"
+      - "8080:8080"
     depends_on:
       - mongodb
       - rabbitmq
@@ -53,7 +55,7 @@ services:
       dockerfile: Dockerfile.web
     container_name: web
     ports:
-      - "3000:3000"
+      - "9090:9090"
     depends_on:
       - api
     volumes:
